@@ -3,7 +3,7 @@ set -Eeuo pipefail
 shopt -s inherit_errexit nullglob
 IFS=$'\n\t'
 
-# Qwen3.8-27B + GLP-49 -> ModelOpt NVFP4 -> DFlash2-b32 -> SGLang
+# Qwen3.8-27B + GLP-49 -> ModelOpt NVFP4 -> DFlash2 (block8) -> SGLang
 # Target: RunPod container based on lmsysorg/sglang:qwen38-27b,
 #         RTX PRO 6000 Blackwell 96GB, /workspace on a >=200GB container disk.
 #
@@ -11,7 +11,7 @@ IFS=$'\n\t'
 # It never runs apt full-upgrade, never touches NVIDIA drivers/CUDA/Torch,
 # and never uses nested Docker.
 
-SCRIPT_VERSION="2026-10-04.1"
+SCRIPT_VERSION="2026-10-04.2"
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 STACK_DIR="${STACK_DIR:-$WORKSPACE/qwen-stack}"
@@ -24,15 +24,15 @@ MERGE_VENV="${MERGE_VENV:-$WORKSPACE/merge-venv}"
 MODELOPT_VENV="${MODELOPT_VENV:-$WORKSPACE/modelopt-venv}"
 
 ADAPTER_REPO="${ADAPTER_REPO:-msuiche/Qwen3.8-27B-abliterated-cyber-GLP-49}"
-DRAFT_REPO="${DRAFT_REPO:-JonasLoos/Qwen3.8-27B-DFlash2-b32}"
-BASE_REPO="${BASE_REPO:-}"
+DRAFT_REPO="${DRAFT_REPO:-z-lab/Qwen3.8-27B-DFlash2}"
+BASE_REPO="${BASE_REPO:-Qwen/Qwen3.8-27B}"
 BASE_REVISION="${BASE_REVISION:-1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0}"
 
 BASE_DIR="$MODELS_DIR/Qwen3.8-27B-BF16"
 ADAPTER_DIR="$MODELS_DIR/Qwen3.8-27B-abliterated-cyber-GLP-49"
 MERGED_DIR="$MODELS_DIR/Qwen3.8-27B-BF16-GLP49"
 NVFP4_DIR="$MODELS_DIR/Qwen3.8-27B-NVFP4-GLP49"
-DRAFT_DIR="$MODELS_DIR/Qwen3.8-27B-DFlash2-b32"
+DRAFT_DIR="$MODELS_DIR/Qwen3.8-27B-DFlash2"
 
 MODELOPT_DIR="$STACK_DIR/Model-Optimizer"
 MODELOPT_REPO="${MODELOPT_REPO:-https://github.com/NVIDIA/Model-Optimizer.git}"
@@ -55,6 +55,7 @@ USE_TMUX="${USE_TMUX:-1}"
 ALLOW_UNSUPPORTED_GPU="${ALLOW_UNSUPPORTED_GPU:-0}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
+ROTATE_API_KEY="${ROTATE_API_KEY:-0}"
 FLASH_JOBS="${FLASH_JOBS:-1}"
 SERVER_START_TIMEOUT="${SERVER_START_TIMEOUT:-900}"
 SERVER_PORT="${SERVER_PORT:-8000}"
@@ -64,8 +65,7 @@ SERVER_SESSION="${SERVER_SESSION:-qwen-server}"
 API_KEY_FILE="$STACK_DIR/.sglang_api_key"
 INSTALL_LOG="$STACK_DIR/install.log"
 QUANT_LOG="$STACK_DIR/quantize.log"
-SERVER_LOG32="$STACK_DIR/server-block32.log"
-SERVER_LOG16="$STACK_DIR/server-block16.log"
+SERVER_LOG="$STACK_DIR/server.log"
 
 ORIGINAL_ARGS=("$@")
 CURRENT_STAGE="bootstrap"
@@ -83,6 +83,7 @@ Options:
   --non-interactive       Never prompt. HF_TOKEN must already be exported if needed.
   --allow-unsupported-gpu Skip the Blackwell/VRAM safety check.
   --force-rebuild         Rebuild merge/NVFP4 even if a validated NVFP4 checkpoint exists.
+  --rotate-api-key        Generate a fresh SGLang API key, replacing the existing local key.
   -h, --help              Show this help.
 
 Useful environment variables:
@@ -93,6 +94,7 @@ Useful environment variables:
   CLEAN_BF16=0             Same as --keep-merged.
   MODELOPT_REF=<git-ref>   Optional Model-Optimizer commit/tag. Existing clone is kept as-is.
   FORCE_REBUILD=1          Same as --force-rebuild.
+  ROTATE_API_KEY=1         Same as --rotate-api-key.
 EOF
 }
 
@@ -105,6 +107,7 @@ while (($#)); do
     --non-interactive) NONINTERACTIVE=1 ;;
     --allow-unsupported-gpu) ALLOW_UNSUPPORTED_GPU=1 ;;
     --force-rebuild) FORCE_REBUILD=1 ;;
+    --rotate-api-key) ROTATE_API_KEY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -206,7 +209,16 @@ valid_draft() {
   compgen -G "$DRAFT_DIR/*.safetensors" >/dev/null || return 1
   local kib
   kib="$(du -sk "$DRAFT_DIR" 2>/dev/null | awk '{print $1}')"
-  [[ "${kib:-0}" -gt 500000 ]]
+  [[ "${kib:-0}" -gt 500000 ]] || return 1
+  python3 - "$DRAFT_DIR/config.json" <<'PY'
+import json, sys
+cfg=json.load(open(sys.argv[1], encoding="utf-8"))
+d=cfg.get("dflash_config") or {}
+assert d.get("block_size") == 8, d
+assert d.get("target_layer_ids") == [5, 19, 33, 47, 61], d
+assert d.get("selector_rank") == 256, d
+assert d.get("selector_top_k") == 16, d
+PY
 }
 
 CURRENT_STAGE="system checks"
@@ -269,7 +281,7 @@ if [[ "$ALLOW_UNSUPPORTED_GPU" != 1 ]]; then
   GPU_CC="$(awk -F= '$1=="cc"{print $2}' <<<"$GPU_INFO")"
   GPU_VRAM="$(awk -F= '$1=="vram_gib"{print int($2)}' <<<"$GPU_INFO")"
   [[ "$GPU_CC" == "12.0" ]] || die "Expected Blackwell SM120 (compute capability 12.0), got $GPU_CC. Set ALLOW_UNSUPPORTED_GPU=1 only if you know the recipe is compatible."
-  (( GPU_VRAM >= 80 )) || die "Expected >=80 GiB VRAM for this 262K/block32 setup, detected ${GPU_VRAM} GiB."
+  (( GPU_VRAM >= 80 )) || die "Expected >=80 GiB VRAM for this 262K/DFlash8 setup, detected ${GPU_VRAM} GiB."
 fi
 log "GPU preflight passed."
 
@@ -335,14 +347,14 @@ if [[ "$FORCE_REBUILD" == 1 ]] || ! valid_merged; then
     info "Adapter already present; skipping gated download."
   fi
 
-  if [[ -z "$BASE_REPO" ]]; then
-    BASE_REPO="$(python3 - "$ADAPTER_DIR/adapter_config.json" <<'PY'
+  ADAPTER_BASE="$(python3 - "$ADAPTER_DIR/adapter_config.json" <<'PY'
 import json,sys
 j=json.load(open(sys.argv[1], encoding="utf-8"))
 print(j.get("base_model_name_or_path") or "")
 PY
 )"
-    BASE_REPO="${BASE_REPO:-Qwen/Qwen3.8-27B}"
+  if [[ -n "$ADAPTER_BASE" && "$ADAPTER_BASE" != "$BASE_REPO" ]]; then
+    warn "Adapter declares base '$ADAPTER_BASE' while BASE_REPO='$BASE_REPO'. Keeping explicit BASE_REPO for reproducibility."
   fi
 
   CURRENT_STAGE="base model download"
@@ -595,13 +607,36 @@ else
   log "Validated NVFP4 checkpoint already exists ($(dir_size_gib "$NVFP4_DIR") GiB); skipping merge, ModelOpt, FlashAttention build, and PTQ."
 fi
 
+# ModelOpt export does not always carry the multimodal AutoProcessor metadata that
+# SGLang/Qwen3.8 expects. Fetch only the tiny metadata files from the exact base revision.
+CURRENT_STAGE="processor metadata"
+for meta in preprocessor_config.json video_preprocessor_config.json; do
+  if [[ ! -s "$NVFP4_DIR/$meta" ]]; then
+    HF_REPO="$BASE_REPO" HF_FILE="$meta" HF_REV="$BASE_REVISION" HF_DEST="$NVFP4_DIR" \
+      "$HF_VENV/bin/python" - <<'PY'
+import os
+from huggingface_hub import hf_hub_download
+hf_hub_download(
+    repo_id=os.environ["HF_REPO"],
+    filename=os.environ["HF_FILE"],
+    revision=os.environ["HF_REV"],
+    local_dir=os.environ["HF_DEST"],
+    token=os.environ.get("HF_TOKEN") or None,
+)
+PY
+  fi
+done
+[[ -s "$NVFP4_DIR/preprocessor_config.json" ]] || die "Missing preprocessor_config.json after metadata repair."
+[[ -s "$NVFP4_DIR/video_preprocessor_config.json" ]] || die "Missing video_preprocessor_config.json after metadata repair."
+log "Qwen3.8 processor metadata present in NVFP4 checkpoint."
+
 CURRENT_STAGE="DFlash2 draft"
 if valid_draft; then
-  log "DFlash2-b32 draft already present ($(dir_size_gib "$DRAFT_DIR") GiB)."
+  log "DFlash2 block8 draft already present ($(dir_size_gib "$DRAFT_DIR") GiB)."
 else
   [[ -d "$DRAFT_DIR" ]] && rm -rf "$DRAFT_DIR"
   retry 3 10 hf_snapshot "$DRAFT_REPO" "$DRAFT_DIR"
-  valid_draft || die "DFlash2-b32 download completed but validation failed."
+  valid_draft || die "DFlash2 block8 download completed but validation failed."
 fi
 
 CURRENT_STAGE="DFlash2 overlay"
@@ -648,18 +683,16 @@ done
 log "DFlash2 overlay applied (${#FILES[@]} files, commit $OVERLAY_COMMIT)."
 
 CURRENT_STAGE="server scripts"
-if [[ ! -s "$API_KEY_FILE" ]]; then
+if [[ "$ROTATE_API_KEY" == 1 || ! -s "$API_KEY_FILE" ]]; then
   umask 077
   openssl rand -hex 32 > "$API_KEY_FILE"
   chmod 600 "$API_KEY_FILE"
-  log "Generated a new SGLang API key at $API_KEY_FILE (not printed to logs)."
+  log "Generated a fresh SGLang API key at $API_KEY_FILE (not printed to logs)."
 fi
 
 cat > "$STACK_DIR/start-server.sh" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-BLOCK="\${1:-32}"
-case "\$BLOCK" in 16|32) ;; *) echo "Block must be 16 or 32" >&2; exit 2 ;; esac
 KEY_FILE=$(printf '%q' "$API_KEY_FILE")
 [[ -s "\$KEY_FILE" ]] || { echo "Missing API key file: \$KEY_FILE" >&2; exit 1; }
 export SGLANG_API_KEY="\$(<"\$KEY_FILE")"
@@ -673,26 +706,28 @@ exec python3 -m sglang.launch_server \
   --api-key "\$SGLANG_API_KEY" \
   --speculative-algorithm DFLASH \
   --speculative-draft-model-path $(printf '%q' "$DRAFT_DIR") \
-  --speculative-num-draft-tokens "\$BLOCK" \
-  --speculative-dflash-block-size "\$BLOCK" \
+  --speculative-num-draft-tokens 8 \
+  --speculative-dflash-block-size 8 \
   --speculative-draft-model-quantization unquant \
-  --speculative-draft-attention-backend triton \
-  --attention-backend triton \
-  --min-free-slots-delay 1 \
+  --speculative-draft-attention-backend flashinfer \
+  --attention-backend flashinfer \
   --kv-cache-dtype fp8_e4m3 \
-  --mem-fraction-static 0.90 \
+  --mem-fraction-static 0.85 \
   --context-length 262144 \
   --max-running-requests 1 \
-  --mamba-radix-cache-strategy extra_buffer \
   --chunked-prefill-size 2048 \
+  --min-free-slots-delay 1 \
+  --mamba-radix-cache-strategy extra_buffer \
+  --mamba-ssm-dtype float32 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
-  --default-chat-template-kwargs '{"reasoning_effort":"medium"}' \
+  --default-chat-template-kwargs '{"reasoning_effort":"xhigh"}' \
   --sampling-defaults model \
   --watchdog-timeout 1800 \
   --host 0.0.0.0 \
   --port $(printf '%q' "$SERVER_PORT")
 EOF
+
 chmod +x "$STACK_DIR/start-server.sh"
 
 cat > "$STACK_DIR/test-api.sh" <<EOF
@@ -719,42 +754,22 @@ chmod +x "$STACK_DIR/test-api.sh"
 cat > "$STACK_DIR/benchmark.sh" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-export QWEN_API_KEY="\$(<$(printf '%q' "$API_KEY_FILE"))"
-export QWEN_URL="http://127.0.0.1:$(printf '%q' "$SERVER_PORT")/v1/chat/completions"
-python3 - <<'PY'
-import json, os, time, urllib.request
-payload={
-    "model":"qwen",
-    "messages":[{"role":"user","content":"Give a detailed technical explanation of Windows IRQL, DPCs, APCs, spin locks, pageable memory and the most common driver bugs involving them."}],
-    "max_tokens":2048,
-    "temperature":0.2,
-}
-data=json.dumps(payload).encode()
-req=urllib.request.Request(
-    os.environ["QWEN_URL"], data=data,
-    headers={
-        "Authorization":"Bearer "+os.environ["QWEN_API_KEY"],
-        "Content-Type":"application/json",
-    },
-)
-t0=time.perf_counter()
-with urllib.request.urlopen(req, timeout=1800) as r:
-    obj=json.load(r)
-dt=time.perf_counter()-t0
-usage=obj.get("usage") or {}
-n=usage.get("completion_tokens")
-print(f"elapsed_s={dt:.3f}")
-print(f"completion_tokens={n}")
-if isinstance(n,(int,float)) and dt>0:
-    print(f"end_to_end_tok_s={n/dt:.2f}")
-choice=(obj.get("choices") or [{}])[0]
-msg=choice.get("message") or {}
-reasoning=msg.get("reasoning_content")
-if reasoning:
-    print("\\n=== reasoning ===\\n"+reasoning[:4000])
-print("\\n=== answer ===\\n"+str(msg.get("content",""))[:8000])
-PY
+export OPENAI_API_KEY="\$(<$(printf '%q' "$API_KEY_FILE"))"
+exec python3 -m sglang.benchmark.serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port $(printf '%q' "$SERVER_PORT") \
+  --model qwen \
+  --tokenizer $(printf '%q' "$NVFP4_DIR") \
+  --dataset-name random \
+  --random-input-len 8192 \
+  --random-output-len 1024 \
+  --random-range-ratio 1.0 \
+  --tokenize-prompt \
+  --num-prompts 1 \
+  --max-concurrency 1
 EOF
+
 chmod +x "$STACK_DIR/benchmark.sh"
 
 server_ready() {
@@ -766,11 +781,10 @@ server_ready() {
 }
 
 start_server_tmux() {
-  local block="$1" logf="$2"
   tmux kill-session -t "$SERVER_SESSION" 2>/dev/null || true
-  : > "$logf"
+  : > "$SERVER_LOG"
   local cmd
-  printf -v cmd '%q %q 2>&1 | tee %q' "$STACK_DIR/start-server.sh" "$block" "$logf"
+  printf -v cmd '%q 2>&1 | tee %q' "$STACK_DIR/start-server.sh" "$SERVER_LOG"
   tmux new-session -d -s "$SERVER_SESSION" "$cmd"
 }
 
@@ -796,32 +810,21 @@ if [[ "$AUTO_START" == 1 ]]; then
     warn "A different SGLang launch_server process already exists but is not healthy on port $SERVER_PORT. Not starting a second copy automatically."
     pgrep -af 'sglang\.launch_server' || true
   else
-    info "Starting DFlash2 block32 in tmux session '$SERVER_SESSION'."
-    start_server_tmux 32 "$SERVER_LOG32"
+    info "Starting Qwen3.8 GLP49 NVFP4 + DFlash2 block8 + FlashInfer in tmux session '$SERVER_SESSION'."
+    start_server_tmux
     if wait_server "$SERVER_START_TIMEOUT"; then
-      log "SGLang block32 is ready."
+      log "SGLang DFlash2 block8 server is ready."
     else
       rc=$?
-      if [[ "$rc" == 10 ]]; then
-        warn "Block32 server exited before becoming ready. Falling back to block16. Log: $SERVER_LOG32"
-        start_server_tmux 16 "$SERVER_LOG16"
-        if wait_server "$SERVER_START_TIMEOUT"; then
-          log "SGLang block16 fallback is ready."
-        else
-          rc2=$?
-          if [[ "$rc2" == 20 ]]; then
-            warn "Block16 is still alive after ${SERVER_START_TIMEOUT}s but not ready yet. Leaving it running. Watch: tail -f $SERVER_LOG16"
-          else
-            die "Both block32 and block16 failed. Inspect $SERVER_LOG32 and $SERVER_LOG16"
-          fi
-        fi
-      elif [[ "$rc" == 20 ]]; then
-        warn "Block32 is still alive after ${SERVER_START_TIMEOUT}s but not ready yet. Leaving it running; no premature fallback. Watch: tail -f $SERVER_LOG32"
+      if [[ "$rc" == 20 ]]; then
+        warn "Server is still alive after ${SERVER_START_TIMEOUT}s but not ready yet. Leaving it running. Watch: tail -f $SERVER_LOG"
+      else
+        die "SGLang server exited before becoming ready. Inspect $SERVER_LOG"
       fi
     fi
   fi
 else
-  info "AUTO_START=0. Start manually with: tmux new -s $SERVER_SESSION '$STACK_DIR/start-server.sh 32'"
+  info "AUTO_START=0. Start manually with: tmux new -s $SERVER_SESSION '$STACK_DIR/start-server.sh'"
 fi
 
 CURRENT_STAGE="summary"
@@ -831,10 +834,10 @@ printf '============================================================\n'
 printf 'NVFP4 model : %s\n' "$NVFP4_DIR"
 printf 'DFlash2     : %s\n' "$DRAFT_DIR"
 printf 'API key file: %s (chmod 600; key intentionally not printed)\n' "$API_KEY_FILE"
-printf 'Start       : %s 32\n' "$STACK_DIR/start-server.sh"
+printf 'Start       : %s\n' "$STACK_DIR/start-server.sh"
 printf 'Test        : %s\n' "$STACK_DIR/test-api.sh"
 printf 'Benchmark   : %s\n' "$STACK_DIR/benchmark.sh"
-printf 'Server logs : %s / %s\n' "$SERVER_LOG32" "$SERVER_LOG16"
+printf 'Server log  : %s\n' "$SERVER_LOG"
 printf 'Install log : %s\n' "$INSTALL_LOG"
 printf 'Disk        : %s GiB free\n' "$(free_gib)"
 printf '============================================================\n'
